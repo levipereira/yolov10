@@ -12,9 +12,13 @@ from .tasks import (
     parse_model,
     torch_safe_load,
     yaml_model_load,
+    quantization_ignore_match,
+    transfer_torch_to_quantization,
 )
 
 __all__ = (
+    "transfer_torch_to_quantization",
+    "quantization_ignore_match",
     "attempt_load_one_weight",
     "attempt_load_weights",
     "parse_model",

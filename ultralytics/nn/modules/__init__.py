@@ -51,6 +51,11 @@ from .block import (
     SCDown,
     RepVGGDW
 )
+
+from .quant_block import (
+    QuantAdd
+)
+
 from .conv import (
     CBAM,
     ChannelAttention,
@@ -143,5 +148,6 @@ __all__ = (
     "C2fCIB",
     "SCDown",
     "RepVGGDW",
-    "v10Detect"
+    "v10Detect",
+    "QuantAdd"
 )

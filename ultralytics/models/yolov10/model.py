@@ -2,14 +2,14 @@ from ultralytics.engine.model import Model
 from ultralytics.nn.tasks import YOLOv10DetectionModel
 from .val import YOLOv10DetectionValidator
 from .predict import YOLOv10DetectionPredictor
-from .train import YOLOv10DetectionTrainer
+from .train import YOLOv10DetectionTrainer, YOLOv10DetectionQuantizerTRT
 
 from huggingface_hub import PyTorchModelHubMixin
 from .card import card_template_text
 
 class YOLOv10(Model, PyTorchModelHubMixin, model_card_template=card_template_text):
 
-    def __init__(self, model="yolov10n.pt", task=None, verbose=False, 
+    def __init__(self, model="yolov10b.pt", task=None, verbose=False, 
                  names=None):
         super().__init__(model=model, task=task, verbose=verbose)
         if names is not None:
@@ -25,12 +25,15 @@ class YOLOv10(Model, PyTorchModelHubMixin, model_card_template=card_template_tex
 
     @property
     def task_map(self):
-        """Map head to model, trainer, validator, and predictor classes."""
+        """Map head to model, trainer, quantizer, validator, and predictor classes."""
         return {
             "detect": {
                 "model": YOLOv10DetectionModel,
                 "trainer": YOLOv10DetectionTrainer,
+                "quantizer": YOLOv10DetectionQuantizerTRT,
                 "validator": YOLOv10DetectionValidator,
                 "predictor": YOLOv10DetectionPredictor,
             },
         }
+
+ 

@@ -1,11 +1,17 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 
 import contextlib
+from typing import List, Callable, Union, Dict
+
 from copy import deepcopy
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+from pytorch_quantization.nn.modules import _utils as quant_nn_utils
+from pytorch_quantization import calib
+ 
 
 from ultralytics.nn.modules import (
     AIFI,
@@ -1060,3 +1066,47 @@ def guess_model_task(model):
         "Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose' or 'obb'."
     )
     return "detect"  # assume detect
+
+
+def quantization_ignore_match(ignore_policy : Union[str, List[str], Callable], path : str) -> bool:
+
+    if ignore_policy is None: return False
+    if isinstance(ignore_policy, Callable):
+        return ignore_policy(path)
+
+    if isinstance(ignore_policy, str) or isinstance(ignore_policy, List):
+
+        if isinstance(ignore_policy, str):
+            ignore_policy = [ignore_policy]
+
+        if path in ignore_policy: return True
+        for item in ignore_policy:
+            if re.match(item, path):
+                return True
+    return False
+
+def transfer_torch_to_quantization(nninstance : torch.nn.Module, quantmodule):
+    quant_instance = quantmodule.__new__(quantmodule)
+    for k, val in vars(nninstance).items():
+        setattr(quant_instance, k, val)
+
+    def __init__(self):
+        if self.__class__.__name__ == 'QuantAvgPool2d':
+            self.__init__(nninstance.kernel_size, nninstance.stride, nninstance.padding, nninstance.ceil_mode, nninstance.count_include_pad)
+        elif isinstance(self, quant_nn_utils.QuantInputMixin):
+            quant_desc_input, quant_desc_weight = quant_nn_utils.pop_quant_desc_in_kwargs(self.__class__)
+            self.init_quantizer(quant_desc_input)
+
+            # Turn on torch_hist to enable higher calibration speeds
+            if isinstance(self._input_quantizer._calibrator, calib.HistogramCalibrator):
+                self._input_quantizer._calibrator._torch_hist = True
+        else:
+            quant_desc_input, quant_desc_weight = quant_nn_utils.pop_quant_desc_in_kwargs(self.__class__)
+            self.init_quantizer(quant_desc_input, quant_desc_weight)
+            # Turn on torch_hist to enable higher calibration speeds
+            if isinstance(self._input_quantizer._calibrator, calib.HistogramCalibrator):
+                self._input_quantizer._calibrator._torch_hist = True
+                self._weight_quantizer._calibrator._torch_hist = True
+
+    __init__(quant_instance)
+    return quant_instance

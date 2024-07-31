@@ -83,7 +83,7 @@ class BaseValidator:
         self.data = None
         self.device = None
         self.batch_i = None
-        self.training = True
+        self.training = False
         self.names = None
         self.seen = None
         self.stats = None
@@ -109,7 +109,7 @@ class BaseValidator:
         """
         self.training = trainer is not None
         augment = self.args.augment and (not self.training)
-        if self.training:
+        if self.training :
             self.device = trainer.device
             self.data = trainer.data
             # self.args.half = self.device.type != "cpu"  # force FP16 val during training
@@ -179,7 +179,7 @@ class BaseValidator:
 
             # Loss
             with dt[2]:
-                if self.training:
+                if not self.training:
                     self.loss += model.loss(batch, preds)[1]
 
             # Postprocess

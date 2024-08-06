@@ -53,7 +53,13 @@ from .block import (
 )
 
 from .quant_block import (
-    QuantAdd
+    QuantAdd,
+    QuantAConvAvgChunk,
+    QuantC2fChunk,
+    QuantConcat,
+    QuantADownAvgChunk,
+    QuantRepNCSPELAN4Chunk,
+    QuantUpsample
 )
 
 from .conv import (
@@ -149,5 +155,11 @@ __all__ = (
     "SCDown",
     "RepVGGDW",
     "v10Detect",
-    "QuantAdd"
+    "QuantAdd",
+    "QuantAConvAvgChunk",
+    "QuantC2fChunk",
+    "QuantConcat",
+    "QuantADownAvgChunk",
+    "QuantRepNCSPELAN4Chunk",
+    "QuantUpsample"
 )

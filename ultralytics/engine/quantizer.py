@@ -20,14 +20,26 @@ import numpy as np
 import torch
 from torch import distributed as dist
 from torch import nn, optim
+import torch.nn.functional as F
 
-from pytorch_quantization import nn as quant_nn , quant_modules , calib
+from pytorch_quantization  import nn as quant_nn , quant_modules , calib, enable_onnx_export
 from pytorch_quantization.tensor_quant import QuantDescriptor
 from absl import logging as quant_logging
+ 
+
+from ultralytics.nn.modules.quant_block import (    
+    QuantAdd,
+    QuantAConvAvgChunk,
+    QuantC2fChunk,
+    QuantConcat,
+    QuantADownAvgChunk,
+    QuantRepNCSPELAN4Chunk,
+    QuantUpsample
+)
 
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
-from ultralytics.nn.tasks import attempt_load_one_weight, attempt_load_weights, quantization_ignore_match, transfer_torch_to_quantization
+from ultralytics.nn.tasks import attempt_load_one_weight, attempt_load_weights, quantization_ignore_match, transfer_torch_to_quantization, find_quantizer_pairs, initialize_quantization
 from ultralytics.utils import (
     DEFAULT_CFG,
     LOGGER,
@@ -41,7 +53,7 @@ from ultralytics.utils import (
     yaml_save,
 )
 from ultralytics.utils.autobatch import check_train_batch_size
-from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
+from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args, check_requirements
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
 from ultralytics.utils.files import get_latest_run
 from ultralytics.utils.torch_utils import (
@@ -54,6 +66,46 @@ from ultralytics.utils.torch_utils import (
     strip_optimizer,
 )
 
+
+
+quant_modules.initialize()
+quant_desc_input = QuantDescriptor(calib_method="histogram")
+quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
+quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
+quant_nn.QuantAvgPool2d.set_default_quant_desc_input(quant_desc_input)
+quant_nn.QuantMaxPool2d.set_default_quant_desc_input(quant_desc_input)
+
+class disable_quantization:
+    def __init__(self, model):
+        self.model  = model
+
+    def apply(self, disabled=True):
+        for name, module in self.model.named_modules():
+            if isinstance(module, quant_nn.TensorQuantizer):
+                module._disabled = disabled
+
+    def __enter__(self):
+        self.apply(True)
+
+    def __exit__(self, *args, **kwargs):
+        self.apply(False)
+
+
+class enable_quantization:
+    def __init__(self, model):
+        self.model  = model
+
+    def apply(self, enabled=True):
+        for name, module in self.model.named_modules():
+            if isinstance(module, quant_nn.TensorQuantizer):
+                module._disabled = not enabled
+
+    def __enter__(self):
+        self.apply(True)
+        return self
+
+    def __exit__(self, *args, **kwargs):
+        self.apply(False)
 
 class BaseQuantizerTRT:
     """
@@ -107,6 +159,7 @@ class BaseQuantizerTRT:
         self.metrics = None
         self.plots = {}
         init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
+        
 
         # Dirs
         self.save_dir = get_save_dir(self.args)
@@ -131,6 +184,7 @@ class BaseQuantizerTRT:
 
         # Model and Dataset
         self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolov8n -> yolov8n.pt
+        self.model_onnx = None
         try:
             if self.args.task == "classify":
                 self.data = check_cls_dataset(self.args.data)
@@ -190,7 +244,6 @@ class BaseQuantizerTRT:
             world_size = 1  # default to device 0
         else:  # i.e. device='cpu' or 'mps'
             world_size = 0
-
         # Run subprocess if DDP training, else train normally
         if world_size > 1 and "LOCAL_RANK" not in os.environ:
             # Argument checks
@@ -217,18 +270,9 @@ class BaseQuantizerTRT:
         else:
             self._do_finetune(world_size)
 
-    def qat_initialize(self):
-        quant_modules.initialize()
-        quant_desc_input = QuantDescriptor(calib_method="histogram")
-        quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
-        quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
-        quant_nn.QuantAvgPool2d.set_default_quant_desc_input(quant_desc_input)
-        quant_nn.QuantMaxPool2d.set_default_quant_desc_input(quant_desc_input)
-        quant_logging.set_verbosity(quant_logging.ERROR)
-
+  
     
-    def replace_to_quantization_module(self, model : torch.nn.Module, ignore_policy : Union[str, List[str], Callable] = None, prefixx=colorstr('QAT:')):
-
+    def replace_to_quantization_module(self, ignore_policy : Union[str, List[str], Callable] = None, prefixx=colorstr('QAT:')):
         module_dict = {}
         for entry in quant_modules._DEFAULT_QUANT_MAP:
             module = getattr(entry.orig_mod, entry.mod_name)
@@ -242,23 +286,208 @@ class BaseQuantizerTRT:
 
                 submodule_id = id(type(submodule))
                 if submodule_id in module_dict:
-                    ignored = quantization_ignore_match(ignore_policy, path)
-                    if ignored:
-                        LOGGER.info(f'{prefixx} Quantization: {path} has ignored.')
-                        continue
-                        
+                    # ignored = quantization_ignore_match(ignore_policy, path)
+                    # if ignored:
+                    #    LOGGER.info(f'{prefixx} Quantization: {path} has ignored.')
+                    #    continue
                     module._modules[name] = transfer_torch_to_quantization(submodule, module_dict[submodule_id])
-        recursive_and_replace_module(model)
-    
-   
+        recursive_and_replace_module(self.model)
+
+    def replace_custom_module_forward(self):
+
+        def repncspelan4_qaunt_forward(self, x):
+            if hasattr(self, "repncspelan4chunkop"):
+                y = list(self.repncspelan4chunkop(self.cv1(x), 2, 1))
+                y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
+                return self.cv4(torch.cat(y, 1))
+            else:
+                y = list(self.cv1(x).split((self.c, self.c), 1))
+                y.extend(m(y[-1]) for m in [self.cv2, self.cv3])
+                return self.cv4(torch.cat(y, 1))
+
+        def repbottleneck_quant_forward(self, x):
+            if hasattr(self, "addop"):
+                return self.addop(x, self.cv2(self.cv1(x))) if self.add else self.cv2(self.cv1(x))
+            return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+        def upsample_quant_forward(self, x):
+            if hasattr(self, "upsampleop"):
+                return self.upsampleop(x)
+            return F.interpolate(x)
+
+        def concat_quant_forward(self, x):
+            if hasattr(self, "concatop"):
+                return self.concatop(x, self.d)
+            return torch.cat(x, self.d)
+
+        def adown_quant_forward(self, x):
+            if hasattr(self, "adownchunkop"):
+                x1, x2 = self.adownchunkop(x)
+                x1 = self.cv1(x1)
+                x2 = torch.nn.functional.max_pool2d(x2, 3, 2, 1)
+                x2 = self.cv2(x2)
+                return torch.cat((x1, x2), 1)
+
+        def aconv_quant_forward(self, x):
+            if hasattr(self, "aconvchunkop"):
+                x = self.aconvchunkop(x)
+                return self.cv1(x)
+        
+        def c2f_qaunt_forward(self, x):
+            if hasattr(self, "c2fchunkop"):
+                y = list(self.c2fchunkop(self.cv1(x), 2, 1))
+                y.extend(m(y[-1]) for m in self.m)
+                return self.cv2(torch.cat(y, 1))
+                
+            else:
+                y = list(self.cv1(x).split((self.c, self.c), 1))
+                y.extend(m(y[-1]) for m in self.m)
+                return self.cv2(torch.cat(y, 1))
+
+
+        for name, module  in self.model.named_modules():
+            if module.__class__.__name__ == "RepNCSPELAN4":
+                if not hasattr(module, "repncspelan4chunkop"):
+                    print(f"Add RepNCSPELAN4QuantChunk to {name}")
+                    module.repncspelan4chunkop = QuantRepNCSPELAN4Chunk(module.c)
+                module.__class__.forward = repncspelan4_qaunt_forward
+
+            if module.__class__.__name__ == "C2f":
+                if not hasattr(module, "c2fchunkop"):
+                    print(f"Add C2fQuantChunk to {name}")
+                    module.c2fchunkop = QuantC2fChunk(module.c)
+                module.__class__.forward = c2f_qaunt_forward
+
+            if module.__class__.__name__ == "ADown":
+                if not hasattr(module, "adownchunkop"):
+                    print(f"Add ADownQuantChunk to {name}")
+                    module.adownchunkop = QuantADownAvgChunk()
+                module.__class__.forward = adown_quant_forward
+
+            if module.__class__.__name__ == "AConv":
+                if not hasattr(module, "aconvchunkop"):
+                    print(f"Add AConvQuantChunk to {name}")
+                    module.aconvchunkop = QuantAConvAvgChunk()
+                module.__class__.forward = aconv_quant_forward
+
+            if module.__class__.__name__ == "RepNBottleneck":
+                if module.add:
+                    if not hasattr(module, "addop"):
+                        print(f"Add QuantAdd to {name}")
+                        module.addop = QuantAdd(module.add)
+                    module.__class__.forward = repbottleneck_quant_forward
+            
+            if module.__class__.__name__ == "Concat":
+                if not hasattr(module, "concatop"):
+                    print(f"Add QuantConcat to {name}")
+                    module.concatop = QuantConcat(module.d)
+                module.__class__.forward = concat_quant_forward
+
+            if module.__class__.__name__ == "Concat":
+                if not hasattr(module, "concatop"):
+                    print(f"Add QuantConcat to {name}")
+                    module.concatop = QuantConcat(module.d)
+                module.__class__.forward = concat_quant_forward
+            
+            if module.__class__.__name__ == "Upsamplex":
+                if not hasattr(module, "upsampleop"):
+                    print(f"Add QuantUpsample to {name}")
+                    module.upsampleop = QuantUpsample(module.size, module.scale_factor, module.mode)
+                module.__class__.forward = upsample_quant_forward
+
     def apply_custom_rules_to_quantizer(self):
-        var=1
+        
+        def export_onnx():
+            requirements = ["onnx>=1.12.0"]
+            check_requirements(requirements)
+            import onnx
+            warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)  
+            warnings.filterwarnings("ignore", category=UserWarning)  
+            warnings.filterwarnings("ignore", category=DeprecationWarning)   
+            im = torch.zeros(1, 3, self.args.imgsz, self.args.imgsz).to(self.device)
+            self.model.eval()
 
-    def calibrate_model(self, model : torch.nn.Module, dataloader, num_batch=25):
+            # with enable_onnx_export():
+            #     torch.onnx.export(
+            #         self.model,   
+            #         im,
+            #         "quantization-custom-rules-temp.onnx",
+            #         verbose=False 
+            #     )
+            model_onnx = onnx.load("quantization-custom-rules-temp.onnx")
+            #os.remove("quantization-custom-rules-temp.onnx")
+            return model_onnx
+        onnx_model = export_onnx()
 
-        def compute_amax(model, **kwargs):
-            for name, module in model.named_modules():
+        def get_attr_with_path(m, path):
+            def sub_attr(m, names):
+                name = names[0]
+                value = getattr(m, name)
+                if len(names) == 1:
+                    return value
+                return sub_attr(value, names[1:])
+            return sub_attr(m, path.split("."))
+
+        def set_module(model, submodule_key, module):
+            tokens = submodule_key.split('.')
+            sub_tokens = tokens[:-1]
+            cur_mod = model
+            for s in sub_tokens:
+                cur_mod = getattr(cur_mod, s)
+            setattr(cur_mod, tokens[-1], module)
+    
+        pairs = find_quantizer_pairs(onnx_model)
+  
+        for major, sub in pairs:
+            print(f"Rules: {sub} match to {major}")
+            get_attr_with_path(self.model, sub)._input_quantizer = get_attr_with_path(self.model, major)._input_quantizer
+        
+
+        for name, module in self.model.named_modules():
+            if module.__class__.__name__ == "RepNBottleneck":
+                if module.add:
+                    print(f"Rules: {name}.add match to {name}.cv1")
+                    major = module.cv1.conv._input_quantizer
+                    module.addop._input0_quantizer = major
+                    module.addop._input1_quantizer = major
+
+            if  isinstance(module, torch.nn.MaxPool2d):
+                    quant_conv_desc_input = QuantDescriptor(num_bits=8, calib_method='histogram')
+                    quant_maxpool2d = quant_nn.QuantMaxPool2d(module.kernel_size,
+                                                            module.stride,
+                                                            module.padding,
+                                                            module.dilation,
+                                                            module.ceil_mode,
+                                                            quant_desc_input = quant_conv_desc_input)
+                    set_module(self.model, name, quant_maxpool2d)
+
+            # if module.__class__.__name__ == 'ADown':
+            #     module.cv1.conv._input_quantizer = module.adownchunkop._chunk_quantizer
+            # if module.__class__.__name__ == 'AConv':
+            #     module.cv1.conv._input_quantizer = module.aconvchunkop._chunk_quantizer
+
+
+    def calibrate_model(self):
+
+        def compute_amax( **kwargs):
+            for name, module in self.model.named_modules():
                 if isinstance(module, quant_nn.TensorQuantizer):
+                    #print(name)
+                    print(module._calibrator)
+                    if module._calibrator is not None:
+                        if isinstance(module._calibrator, calib.MaxCalibrator):
+                            module.load_calib_amax()
+                        else:
+                            module.load_calib_amax(**kwargs)
+                        module._amax = module._amax.to(self.device)
+                        if torch.any(module._amax <= 1e-6):
+                            module._amax = torch.clamp(module._amax, min=1e-6)
+
+
+        def compute_amax_x(**kwargs):
+            for name, module in self.model.named_modules():
+                if isinstance(module, quant_nn.TensorQuantizer):
+                    print(module)
                     if module._calibrator is not None:
                         if isinstance(module._calibrator, calib.MaxCalibrator):
                             module.load_calib_amax()
@@ -267,30 +496,28 @@ class BaseQuantizerTRT:
 
                         module._amax = module._amax.to(self.device)
             
-        def collect_stats(model, data_loader, device, num_batch=200):
+        def collect_stats(num_batch=200):
             """Feed data to the network and collect statistics"""
-            # Enable calibrators
-            model.eval()
-            for name, module in model.named_modules():
 
+            for name, module in self.model.named_modules():
                 if isinstance(module, quant_nn.TensorQuantizer):
-                    if module._calibrator is not None:
-                        module.disable_quant()
-                        module.enable_calib()
-                    else:
-                        module.disable()
+                    #if module._calibrator is not None:
+                    module.disable_quant()
+                    module.enable_calib()
+                    #else:
+                    #    module.disable()
 
-            # Feed data to the network for collecting stats
             with torch.no_grad():
-                for i, datas in TQDM(enumerate(data_loader), total=num_batch, desc="Collect stats for calibrating"):
-                    imgs = datas['img'].to(device, non_blocking=True).float() / 255.0
-                    model(imgs)
+                for i, datas in TQDM(enumerate(self.train_loader), total=num_batch, desc="Collect stats for calibrating"):
+                    imgs = datas['img'].to(self.device, non_blocking=True).float() / 255.0
+                    self.model(imgs)
 
                     if i >= num_batch:
                         break
+            
 
-            # Disable calibrators
-            for name, module in model.named_modules():
+            self.model.cuda()
+            for name, module in self.model.named_modules():
                 if isinstance(module, quant_nn.TensorQuantizer):
                     if module._calibrator is not None:
                         module.enable_quant()
@@ -299,16 +526,10 @@ class BaseQuantizerTRT:
                         module.enable()
         
         with torch.no_grad():
-            collect_stats(model, dataloader, self.device, num_batch=num_batch)
-            #compute_amax(model, method="percentile", percentile=99.99, strict=True) # strict=False avoid Exception when some quantizer are never used
-            compute_amax(model, method="mse") 
+            collect_stats(num_batch=50)
+            #compute_amax(method="percentile", percentile=99.99, strict=True) # strict=False avoid Exception when some quantizer are never used
+            compute_amax(method="mse", strict=False) 
     
-
- 
-            #quantize.replace_to_quantization_module(model, ignore_policy=ignore_policy)
-        #quantize.apply_custom_rules_to_quantizer(model, export_onnx)
-        #quantize.calibrate_model(model, train_dataloader, device)
-
 
     def _setup_scheduler(self):
         """Initialize training learning rate scheduler."""
@@ -444,11 +665,21 @@ class BaseQuantizerTRT:
         epoch = self.start_epoch
         
         ignore_policy=f"model\.9999999999\.cv\d+\.\d+\.\d+(\.conv)?" 
-        self.qat_initialize()
-        self.replace_to_quantization_module(self.model, ignore_policy=ignore_policy)
-        #quantize.apply_custom_rules_to_quantizer(model, export_onnx)
-        self.calibrate_model(self.model, self.train_loader, 25)
-        self.metrics  = self.validate()
+        self.replace_custom_module_forward()
+        self.replace_to_quantization_module(ignore_policy=ignore_policy)
+        self.apply_custom_rules_to_quantizer()
+        self.calibrate_model()
+        
+        # with disable_quantization(self.model):
+        #     LOGGER.info(f"\n Eval Origin")
+        #     self.metrics  = self.validate()
+        #     print(self.metrics)
+        # with enable_quantization(self.model):
+        #     LOGGER.info(f"\n Eval PQT")
+        #     self.metrics  = self.validate()
+        #     torch.save({"model": self.model},'pqt_yolov10.pt')
+        #     print(self.metrics)
+        torch.save({"model": self.model},'pqt_yolov10.pt')
         raise
         while True:
             self.epoch = epoch

@@ -108,6 +108,7 @@ class BaseValidator:
         gets priority).
         """
         self.training = trainer is not None
+        self.training = False
         augment = self.args.augment and (not self.training)
         if self.training :
             self.device = trainer.device
@@ -179,7 +180,7 @@ class BaseValidator:
 
             # Loss
             with dt[2]:
-                if not self.training:
+                if self.training:
                     self.loss += model.loss(batch, preds)[1]
 
             # Postprocess

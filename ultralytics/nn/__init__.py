@@ -14,9 +14,13 @@ from .tasks import (
     yaml_model_load,
     quantization_ignore_match,
     transfer_torch_to_quantization,
+    find_quantizer_pairs,
+    initialize_quantization
 )
 
 __all__ = (
+    "initialize_quantization",
+    "find_quantizer_pairs",
     "transfer_torch_to_quantization",
     "quantization_ignore_match",
     "attempt_load_one_weight",

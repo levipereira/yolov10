@@ -10,17 +10,6 @@ from copy import deepcopy
 from ultralytics import YOLO
 from ultralytics.utils.torch_utils import select_device
 from ultralytics.nn.modules import C2f, Detect, RTDETRDecoder, v10Detect
-from pytorch_quantization import nn as quant_nn , quant_modules , calib , enable_onnx_export
-from pytorch_quantization.tensor_quant import QuantDescriptor
-quant_modules.initialize()
-quant_desc_input = QuantDescriptor(calib_method="histogram")
-quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
-quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
-quant_nn.QuantAvgPool2d.set_default_quant_desc_input(quant_desc_input)
-quant_nn.QuantMaxPool2d.set_default_quant_desc_input(quant_desc_input)
-
-
-from ultralytics.nn.tasks import attempt_load_one_weight, attempt_load_weights, quantization_ignore_match, transfer_torch_to_quantization, find_quantizer_pairs, initialize_quantization
 
 class End2End(nn.Module):
     def __init__(self):
@@ -41,13 +30,15 @@ def suppress_warnings():
 
 
 def yolov10_export(weights, device):
-    model = YOLO(weights)
+    model = YOLO(weights , 'quantizer' )
+    print(model)
+    raise
     model = deepcopy(model.model).to(device)
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
     model.float()
-    model = model.fuse()
+    #model = model.fuse()
     for k, m in model.named_modules():
         if isinstance(m, (Detect, RTDETRDecoder)):
             m.dynamic = False
@@ -70,16 +61,15 @@ def main(args):
     device = select_device('cpu')
     model = yolov10_export(args.weights, device)
     model.eval()
-    quant_nn.TensorQuantizer.use_fb_fake_quant = True
 
     batch_size = 'batch'
 
-    if len(model.names.keys()) > 0:
-        print('\nCreating labels.txt file')
-        f = open('labels.txt', 'w')
-        for name in model.names.values():
-            f.write(name + '\n')
-        f.close()
+    # if len(model.names.keys()) > 0:
+    #     print('\nCreating labels.txt file')
+    #     f = open('labels.txt', 'w')
+    #     for name in model.names.values():
+    #         f.write(name + '\n')
+    #     f.close()
     
     model = nn.Sequential(model, End2End())
 
@@ -105,11 +95,9 @@ def main(args):
     dynamic_axes.update(output_axes)
     
     print('\nExporting the model to ONNX')
-    quant_nn.TensorQuantizer.use_fb_fake_quant = True
-    with enable_onnx_export():
-        torch.onnx.export(model, onnx_input_im, onnx_output_file, verbose=False, opset_version=args.opset,
-                        do_constant_folding=True, input_names=['images'], output_names=output_names,
-                        dynamic_axes=dynamic_axes)
+    torch.onnx.export(model, onnx_input_im, onnx_output_file, verbose=False, opset_version=args.opset,
+                    do_constant_folding=True, input_names=['images'], output_names=output_names,
+                    dynamic_axes=dynamic_axes)
 
     model_onnx = onnx.load(onnx_output_file)  # load onnx model
     onnx.checker.check_model(model_onnx)  # check onnx model

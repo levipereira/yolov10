@@ -1,0 +1,47 @@
+ 
+## https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-05.html
+FROM nvcr.io/nvidia/pytorch:24.05-py3
+
+ENV OMP_NUM_THREADS=1
+
+ARG PIP_EXTRA_INDEX_URL="https://pypi.nvidia.com https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
+ENV PIP_EXTRA_INDEX_URL=$PIP_EXTRA_INDEX_URL
+
+RUN apt-get update && apt-get -y install python-is-python3 openmpi-bin libopenmpi-dev wget git git-lfs unzip
+RUN apt update \
+    && apt install --no-install-recommends -y \
+    gcc git zip curl htop \
+    libgl1 libglib2.0-0 libpython3-dev \
+    gnupg g++ libusb-1.0-0 build-essential \
+    python-is-python3 openmpi-bin libopenmpi-dev \
+    wget git-lfs unzip 
+
+RUN python -m pip install --upgrade pip 
+
+RUN rm -rf /usr/lib/python3/dist-packages/setuptools*
+RUN pip install setuptools -U
+RUN pip uninstall cudf -y
+
+
+ARG MODELOPT_VERSION=0.15.0
+RUN pip install "nvidia-modelopt[all]~=$MODELOPT_VERSION" -U
+RUN python -c "import modelopt"
+
+RUN pip install \
+    --find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html \
+    datasets \
+    jax[cuda12_pip]==0.4.26 \
+    onnxconverter-common \
+    onnxmltools \
+    optimum \
+    sentencepiece \
+    timm 
+
+RUN pip install \
+    pycocotools==2.0.7 \
+    onnxslim==0.1.31 \
+    gradio==4.42.0 \
+    opencv-python==4.8.0.74 \
+    py-cpuinfo==9.0.0 \
+    seaborn \
+    onnxsim
